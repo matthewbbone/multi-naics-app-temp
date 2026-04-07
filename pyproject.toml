@@ -1,0 +1,12 @@
+[project]
+name = "multi-naics-app-temp"
+version = "0.1.0"
+description = "Single-page Streamlit app for comparing Amazon V0 and V1 location labeling."
+readme = "README.md"
+requires-python = ">=3.12"
+dependencies = [
+    "altair>=5.5.0",
+    "openpyxl>=3.1.5",
+    "pandas>=2.3.3",
+    "streamlit>=1.56.0",
+]
