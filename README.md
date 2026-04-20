@@ -12,6 +12,7 @@ uv run streamlit run app.py
 ```
 
 The app expects the workbook file `multi-naics-review.xlsx` to remain in the repository root next to `app.py`.
+On startup it downloads the current-side CSV from the configured Google Drive share link and falls back to the local caches if that download is unavailable.
 
 ## Streamlit Community Cloud Deploy
 

@@ -4,15 +4,24 @@ from __future__ import annotations
 
 import hashlib
 import json
+import re
+import tempfile
 from pathlib import Path
 from typing import Any
+from urllib.error import HTTPError, URLError
+from urllib.parse import parse_qs, urlencode, urlparse
+from urllib.request import HTTPCookieProcessor, Request, build_opener
+import http.cookiejar
 
 import altair as alt
 import pandas as pd
 import streamlit as st
 
 WORKBOOK_PATH = Path("multi-naics-review.xlsx")
-CURRENT_PORTABLE_CSV_PATH = Path("multi-naics-current-minimal.csv")
+CURRENT_PORTABLE_CSV_URL = (
+    "https://drive.google.com/file/d/1aAHXN7rW6XBnm2whhmRr4ChCxHuHG-bH/view?usp=sharing"
+)
+CURRENT_PORTABLE_CSV_DOWNLOAD_PATH = Path(tempfile.gettempdir()) / "multi-naics-current-minimal.csv"
 JOB_MATCH_CACHE_DIR = Path(".job_establishment_match_cache")
 INDUSTRY_LABEL_CACHE_DIR = Path(".industry_label_cache")
 DISCOVERIES_PATH = Path("discovered_establishments.json")
@@ -71,6 +80,7 @@ TOP3_COLUMNS = [
     "SECONDARY_ESTABLISHMENT_NAICS6_NAME",
     "TERTIARY_ESTABLISHMENT_NAICS6_NAME",
 ]
+HTTP_USER_AGENT = "Mozilla/5.0 (compatible; multi-naics-app/1.0)"
 
 
 def normalize_text(value: object) -> str:
@@ -103,6 +113,109 @@ def read_json_payload(path: Path) -> Any:
         return json.loads(path.read_text(encoding="utf-8"))
     except (FileNotFoundError, json.JSONDecodeError):
         return None
+
+
+def extract_google_drive_file_id(url: str) -> str:
+    """Extract a Google Drive file id from a shared file URL."""
+    parsed = urlparse(url)
+    if parsed.netloc not in {"drive.google.com", "www.drive.google.com"}:
+        raise ValueError(f"Unsupported Google Drive URL: {url}")
+
+    match = re.search(r"/file/d/([^/]+)", parsed.path)
+    if match:
+        return match.group(1)
+
+    file_ids = parse_qs(parsed.query).get("id", [])
+    if file_ids:
+        return file_ids[0]
+
+    raise ValueError(f"Could not extract Google Drive file id from URL: {url}")
+
+
+def build_google_drive_download_url(file_id: str, extra_params: dict[str, str] | None = None) -> str:
+    """Build a Google Drive download URL for one file id."""
+    params = {"export": "download", "id": file_id}
+    if extra_params:
+        params.update(extra_params)
+    return f"https://drive.google.com/uc?{urlencode(params)}"
+
+
+def response_is_download(response: Any) -> bool:
+    """Return whether a URL response looks like a file download."""
+    content_disposition = response.headers.get("Content-Disposition", "")
+    content_type = response.headers.get("Content-Type", "")
+    return "attachment" in content_disposition.casefold() or "text/csv" in content_type.casefold()
+
+
+def extract_drive_confirmation_params(html: str, cookie_jar: http.cookiejar.CookieJar) -> dict[str, str]:
+    """Extract the hidden confirmation form fields Google Drive returns for large files."""
+    hidden_inputs = {
+        name: value
+        for name, value in re.findall(
+            r'<input[^>]+type="hidden"[^>]+name="([^"]+)"[^>]+value="([^"]*)"',
+            html,
+        )
+    }
+    if {"id", "export", "confirm"}.issubset(hidden_inputs):
+        return hidden_inputs
+
+    for cookie in cookie_jar:
+        if cookie.name.startswith("download_warning"):
+            return {"confirm": cookie.value}
+
+    confirm_match = re.search(r"confirm=([0-9A-Za-z_-]+)", html)
+    if confirm_match:
+        return {"confirm": confirm_match.group(1)}
+
+    return {}
+
+
+def stream_response_to_file(response: Any, destination_path: Path) -> None:
+    """Persist a streamed HTTP response to a local file atomically."""
+    destination_path.parent.mkdir(parents=True, exist_ok=True)
+    temp_path = destination_path.with_suffix(destination_path.suffix + ".tmp")
+    with temp_path.open("wb") as handle:
+        while True:
+            chunk = response.read(1024 * 1024)
+            if not chunk:
+                break
+            handle.write(chunk)
+    temp_path.replace(destination_path)
+
+
+def download_google_drive_file(shared_url: str, destination_path: Path) -> Path:
+    """Download one shared Google Drive file to a local path."""
+    file_id = extract_google_drive_file_id(shared_url)
+    cookie_jar = http.cookiejar.CookieJar()
+    opener = build_opener(HTTPCookieProcessor(cookie_jar))
+
+    def open_drive_url(url: str) -> Any:
+        request = Request(url, headers={"User-Agent": HTTP_USER_AGENT})
+        return opener.open(request, timeout=180)
+
+    try:
+        initial_response = open_drive_url(build_google_drive_download_url(file_id))
+        if response_is_download(initial_response):
+            stream_response_to_file(initial_response, destination_path)
+            return destination_path
+
+        html = initial_response.read().decode("utf-8", errors="ignore")
+        confirm_params = extract_drive_confirmation_params(html, cookie_jar)
+        if not confirm_params:
+            raise ValueError("Google Drive did not return downloadable content for the shared file.")
+
+        confirm_params.setdefault("id", file_id)
+        confirm_params.setdefault("export", "download")
+        confirmed_response = open_drive_url(
+            f"https://drive.google.com/uc?{urlencode(confirm_params)}",
+        )
+        if not response_is_download(confirmed_response):
+            raise ValueError("Google Drive confirmation flow did not return the CSV download.")
+
+        stream_response_to_file(confirmed_response, destination_path)
+        return destination_path
+    except (HTTPError, URLError, TimeoutError) as exc:
+        raise RuntimeError(f"Failed to download current CSV from Google Drive: {exc}") from exc
 
 
 def build_discovery_establishment_cache_key(
@@ -392,7 +505,13 @@ def build_current_portable_df(v1_df: pd.DataFrame) -> pd.DataFrame:
     ).reset_index(drop=True)
 
 
-def load_current_portable_rows(current_csv_path: Path) -> tuple[pd.DataFrame, dict[str, Any]]:
+def load_current_portable_rows(
+    current_csv_path: Path,
+    *,
+    source: str = "portable_csv",
+    source_label: str | None = None,
+    source_url: str | None = None,
+) -> tuple[pd.DataFrame, dict[str, Any]]:
     """Load already-normalized current-side rows from a portable CSV."""
     if not current_csv_path.exists():
         raise FileNotFoundError(f"Portable current CSV not found: {current_csv_path}")
@@ -403,8 +522,10 @@ def load_current_portable_rows(current_csv_path: Path) -> tuple[pd.DataFrame, di
         pd.to_numeric(current_df["POSTINGS_COUNT"], errors="coerce").fillna(0).astype(int)
     )
     return current_df, {
-        "source": "portable_csv",
+        "source": source,
         "portable_csv_path": str(current_csv_path),
+        "portable_csv_label": source_label or current_csv_path.name,
+        "portable_csv_url": source_url,
         "represented_jobs": int(len(current_df)),
     }
 
@@ -440,14 +561,24 @@ def export_current_portable_csv(
 
 def load_current_source_rows(
     *,
-    current_csv_path: Path | None,
+    current_csv_url: str | None,
+    current_csv_download_path: Path | None,
     match_cache_dir: Path,
     label_cache_dir: Path,
     discoveries_path: Path,
 ) -> tuple[pd.DataFrame, dict[str, Any]]:
-    """Load current-side rows from a portable CSV when available, otherwise from caches."""
-    if current_csv_path is not None and current_csv_path.exists():
-        return load_current_portable_rows(current_csv_path)
+    """Load current-side rows from the downloaded CSV when available, otherwise from caches."""
+    if current_csv_url is not None and current_csv_download_path is not None:
+        try:
+            downloaded_path = download_google_drive_file(current_csv_url, current_csv_download_path)
+            return load_current_portable_rows(
+                downloaded_path,
+                source="portable_csv_download",
+                source_label="Google Drive CSV",
+                source_url=current_csv_url,
+            )
+        except (RuntimeError, ValueError, FileNotFoundError):
+            pass
 
     return load_current_match_rows(
         match_cache_dir=match_cache_dir,
@@ -759,7 +890,8 @@ def read_sheet_with_aliases(workbook: Path, sheet_names: tuple[str, ...], label:
 @st.cache_data(show_spinner=False)
 def load_review_payload(
     workbook_path: str | Path,
-    current_csv_path: str | Path | None = CURRENT_PORTABLE_CSV_PATH,
+    current_csv_url: str | None = CURRENT_PORTABLE_CSV_URL,
+    current_csv_download_path: str | Path | None = CURRENT_PORTABLE_CSV_DOWNLOAD_PATH,
 ) -> dict[str, Any]:
     """Load the workbook plus cached current results and build the review payload."""
     workbook = Path(workbook_path)
@@ -767,9 +899,12 @@ def load_review_payload(
         raise FileNotFoundError(f"Workbook not found: {workbook}")
 
     v0_raw = read_sheet_with_aliases(workbook, V0_SHEET_ALIASES, "V0")
-    resolved_current_csv_path = None if current_csv_path is None else Path(current_csv_path)
+    resolved_current_csv_download_path = (
+        None if current_csv_download_path is None else Path(current_csv_download_path)
+    )
     v1_raw, current_source_stats = load_current_source_rows(
-        current_csv_path=resolved_current_csv_path,
+        current_csv_url=current_csv_url,
+        current_csv_download_path=resolved_current_csv_download_path,
         match_cache_dir=JOB_MATCH_CACHE_DIR,
         label_cache_dir=INDUSTRY_LABEL_CACHE_DIR,
         discoveries_path=DISCOVERIES_PATH,
@@ -1088,11 +1223,14 @@ def render_overview_tab(payload: dict[str, Any]) -> None:
     render_metric_row(metrics)
 
     if current_source_stats:
-        if current_source_stats.get("source") == "portable_csv":
+        if current_source_stats.get("source") in {"portable_csv", "portable_csv_download"}:
+            source_label = current_source_stats.get("portable_csv_label") or Path(
+                str(current_source_stats["portable_csv_path"]),
+            ).name
             stats_text = (
                 "V1 represents "
                 f"{current_source_stats['represented_jobs']:,} matched jobs loaded from "
-                f"`{Path(str(current_source_stats['portable_csv_path'])).name}`."
+                f"`{source_label}`."
             )
         else:
             stats_text = (
@@ -1325,12 +1463,12 @@ def main() -> None:
     )
     st.title("Amazon Multi-Industry Location Comparison")
     st.caption(
-        "Sources: `multi-naics-review.xlsx` (`multi-naics-0`) + `multi-naics-current-minimal.csv` when present, "
+        "Sources: `multi-naics-review.xlsx` (`multi-naics-0`) + Google Drive current CSV on startup, "
         "otherwise `.job_establishment_match_cache` + `.industry_label_cache` + `discovered_establishments.json`.",
     )
 
     try:
-        payload = load_review_payload(WORKBOOK_PATH, CURRENT_PORTABLE_CSV_PATH)
+        payload = load_review_payload(WORKBOOK_PATH, CURRENT_PORTABLE_CSV_URL)
     except (FileNotFoundError, ValueError) as exc:
         st.error(str(exc))
         st.stop()
